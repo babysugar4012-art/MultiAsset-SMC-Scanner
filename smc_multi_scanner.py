@@ -18,34 +18,50 @@ ASSETS = {
 }
 
 def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram tokens missing.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    requests.post(url, data=payload)
+    try:
+        res = requests.post(url, data=payload)
+        print("Telegram Sent:", res.status_code)
+    except Exception as e:
+        print("Telegram Error:", e)
+
+# Test heartbeat on every execution
+now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+send_telegram(f"🤖 SMC Scanner ACTIVE & RUNNING\n⏰ Time: {now_str}\nStatus: Scanning all 7 assets...")
 
 def is_in_killzone():
-    # London & New York Active Trading Window (06:00 UTC to 20:00 UTC)
-    # Crypto (BTC/ETH) bypasses session timing due to 24/7 liquidity
     now_utc = datetime.utcnow().time()
-    london_ny_start = time(6, 0)
-    london_ny_end = time(20, 0)
-    return london_ny_start <= now_utc <= london_ny_end
+    return time(6, 0) <= now_utc <= time(20, 0)
 
 def analyze_institutional_smc(symbol_name, ticker):
+    # Fetch Data
     df_4h = yf.download(ticker, period="60d", interval="1h", progress=False)
     df_15m = yf.download(ticker, period="5d", interval="15m", progress=False)
+
+    if df_4h.empty or df_15m.empty:
+        return
+
+    # Handle multi-index columns from yfinance
+    if isinstance(df_4h.columns, pd.MultiIndex):
+        df_4h.columns = df_4h.columns.get_level_values(0)
+    if isinstance(df_15m.columns, pd.MultiIndex):
+        df_15m.columns = df_15m.columns.get_level_values(0)
 
     if len(df_4h) < 50 or len(df_15m) < 30:
         return
 
-    # Check Kill Zone Timing (Skip Forex/Metals outside high volume hours)
     if "BTC" not in symbol_name and "ETH" not in symbol_name:
         if not is_in_killzone():
             return
 
     # --- 1. 4H HTF BIAS ANALYSIS ---
-    htf_high = df_4h['High'].iloc[-20:-2].max()
-    htf_low = df_4h['Low'].iloc[-20:-2].min()
-    htf_close = df_4h['Close'].iloc[-1]
+    htf_high = float(df_4h['High'].iloc[-20:-2].max())
+    htf_low = float(df_4h['Low'].iloc[-20:-2].min())
+    htf_close = float(df_4h['Close'].iloc[-1])
 
     htf_bullish = htf_close > (htf_high + htf_low) / 2
     htf_bearish = not htf_bullish
@@ -53,14 +69,23 @@ def analyze_institutional_smc(symbol_name, ticker):
     # --- 2. 15M LTF STRUCTURE & SWEEP ---
     df_15m['ATR'] = (df_15m['High'] - df_15m['Low']).rolling(14).mean()
     
-    c0_close = df_15m['Close'].iloc[-1]
-    c1_high, c1_low, c1_close = df_15m['High'].iloc[-2], df_15m['Low'].iloc[-2], df_15m['Close'].iloc[-2]
-    c2_high, c2_low = df_15m['High'].iloc[-3], df_15m['Low'].iloc[-3]
-    c3_high, c3_low = df_15m['High'].iloc[-4], df_15m['Low'].iloc[-4]
-    atr = df_15m['ATR'].iloc[-1]
+    c0_close = float(df_15m['Close'].iloc[-1])
+    c1_high = float(df_15m['High'].iloc[-2])
+    c1_low = float(df_15m['Low'].iloc[-2])
+    c1_close = float(df_15m['Close'].iloc[-2])
+    
+    c2_high = float(df_15m['High'].iloc[-3])
+    c2_low = float(df_15m['Low'].iloc[-3])
+    c2_open = float(df_15m['Open'].iloc[-3])
+    c2_close_val = float(df_15m['Close'].iloc[-3])
 
-    swing_high_15m = df_15m['High'].iloc[-22:-2].max()
-    swing_low_15m = df_15m['Low'].iloc[-22:-2].min()
+    c3_high = float(df_15m['High'].iloc[-4])
+    c3_low = float(df_15m['Low'].iloc[-4])
+    
+    atr = float(df_15m['ATR'].iloc[-1])
+
+    swing_high_15m = float(df_15m['High'].iloc[-22:-2].max())
+    swing_low_15m = float(df_15m['Low'].iloc[-22:-2].min())
 
     bull_sweep = (c1_low < swing_low_15m) and (c1_close > swing_low_15m)
     bear_sweep = (c1_high > swing_high_15m) and (c1_close < swing_high_15m)
@@ -68,24 +93,19 @@ def analyze_institutional_smc(symbol_name, ticker):
     bull_mss = bull_sweep and (c1_close > c2_high)
     bear_mss = bear_sweep and (c1_close < c2_low)
 
-    # --- 3. ORDER BLOCK & FVG CONFLUENCE ---
     bull_fvg = c1_low > c3_high
     bear_fvg = c1_high < c3_low
 
-    # Identify 15M Order Block (Last opposite candle before displacement)
-    c2_open, c2_close_val = df_15m['Open'].iloc[-3], df_15m['Close'].iloc[-3]
-    bull_ob = (c2_close_val < c2_open) and bull_mss  # Bearish candle before bullish displacement
-    bear_ob = (c2_close_val > c2_open) and bear_mss  # Bullish candle before bearish displacement
+    bull_ob = (c2_close_val < c2_open) and bull_mss
+    bear_ob = (c2_close_val > c2_open) and bear_mss
 
-    # --- 4. OPTIMAL TRADE ENTRY (OTE / DISCOUNT-PREMIUM FILTER) ---
     swing_range = swing_high_15m - swing_low_15m
-    discount_level = swing_low_15m + (swing_range * 0.382) # Entry in bottom 38.2% (Discount)
-    premium_level = swing_high_15m - (swing_range * 0.382)  # Entry in top 38.2% (Premium)
+    discount_level = swing_low_15m + (swing_range * 0.382)
+    premium_level = swing_high_15m - (swing_range * 0.382)
 
     in_discount = c0_close <= discount_level
     in_premium = c0_close >= premium_level
 
-    # --- FINAL HIGH-CONFLUENCE VALIDATION ---
     valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob) and in_discount
     valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob) and in_premium
 
