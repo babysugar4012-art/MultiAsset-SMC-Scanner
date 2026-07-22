@@ -25,13 +25,9 @@ def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         res = requests.post(url, data=payload)
-        print("Telegram Sent:", res.status_code)
+        print("Telegram Sent Status:", res.status_code)
     except Exception as e:
         print("Telegram Error:", e)
-
-# Test heartbeat on every execution
-now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-send_telegram(f"🤖 SMC Scanner ACTIVE & RUNNING\n⏰ Time: {now_str}\nStatus: Scanning all 7 assets...")
 
 def is_in_killzone():
     now_utc = datetime.utcnow().time()
@@ -54,6 +50,7 @@ def analyze_institutional_smc(symbol_name, ticker):
     if len(df_4h) < 50 or len(df_15m) < 30:
         return
 
+    # Skip Forex & Metals outside high-volume Kill Zones
     if "BTC" not in symbol_name and "ETH" not in symbol_name:
         if not is_in_killzone():
             return
