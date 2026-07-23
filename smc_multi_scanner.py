@@ -1,20 +1,21 @@
 import os
 import requests
-import yfinance as yf
 import pandas as pd
 from datetime import datetime, time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# Symbol mapping for Twelve Data API
 ASSETS = {
-    "EUR/USD": "EURUSD=X",
-    "XAU/USD (Gold)": "GC=F",
-    "BTC/USD": "BTC-USD",
-    "ETH/USD": "ETH-USD",
-    "USD/JPY": "JPY=X",
-    "GBP/JPY": "GBPJPY=X",
-    "XAG/USD (Silver)": "SI=F"
+    "EUR/USD": "EUR/USD",
+    "XAU/USD (Gold)": "XAU/USD",
+    "BTC/USD": "BTC/USD",
+    "ETH/USD": "ETH/USD",
+    "USD/JPY": "USD/JPY",
+    "GBP/JPY": "GBP/JPY",
+    "XAG/USD (Silver)": "XAG/USD"
 }
 
 def send_telegram(message):
@@ -33,22 +34,40 @@ def is_in_killzone():
     now_utc = datetime.utcnow().time()
     return time(6, 0) <= now_utc <= time(20, 0)
 
-def analyze_institutional_smc(symbol_name, ticker):
-    # Fetch Data
-    df_4h = yf.download(ticker, period="60d", interval="1h", progress=False)
-    df_15m = yf.download(ticker, period="5d", interval="15m", progress=False)
+def fetch_twelve_data(symbol, interval, outputsize):
+    """Fetches clean OHLCV data from Twelve Data API."""
+    if not TWELVE_DATA_API_KEY:
+        print("❌ TWELVE_DATA_API_KEY environment variable missing!")
+        return pd.DataFrame()
+
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
+    try:
+        response = requests.get(url).json()
+        if "values" not in response:
+            print(f"⚠️ Twelve Data Error for {symbol} ({interval}): {response.get('message', 'No values returned')}")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(response["values"])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+        
+        # Convert numeric columns
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+            
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        return df
+    except Exception as e:
+        print(f"Error fetching {symbol} from Twelve Data: {e}")
+        return pd.DataFrame()
+
+def analyze_institutional_smc(symbol_name, symbol_code):
+    # Fetch 4H (240m) and 15M candles from Twelve Data
+    df_4h = fetch_twelve_data(symbol_code, "4h", 60)
+    df_15m = fetch_twelve_data(symbol_code, "15min", 50)
 
     if df_4h.empty or df_15m.empty:
-        print(f"⚠️ Could not fetch data for {symbol_name}")
-        return
-
-    # Handle multi-index columns from yfinance
-    if isinstance(df_4h.columns, pd.MultiIndex):
-        df_4h.columns = df_4h.columns.get_level_values(0)
-    if isinstance(df_15m.columns, pd.MultiIndex):
-        df_15m.columns = df_15m.columns.get_level_values(0)
-
-    if len(df_4h) < 50 or len(df_15m) < 30:
+        print(f"⚠️ Skipping {symbol_name} due to missing data.")
         return
 
     # Skip Forex & Metals outside high-volume Kill Zones
@@ -110,7 +129,7 @@ def analyze_institutional_smc(symbol_name, ticker):
 
     # PRINT LIVE STATUS TO GITHUB TERMINAL LOGS
     htf_str = "BULLISH" if htf_bullish else "BEARISH"
-    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
+    print(f"🔍 {symbol_name} | Live Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
 
     if valid_buy or valid_sell:
         direction = "INSTITUTIONAL BUY (4H + OB + OTE)" if valid_buy else "INSTITUTIONAL SELL (4H + OB + OTE)"
@@ -128,7 +147,7 @@ def analyze_institutional_smc(symbol_name, ticker):
                f"📍 Entry: {round(c0_close, 4)}\n🛡️ Stop Loss: {round(sl, 4)}\n🎯 Take Profit (1:3): {round(tp, 4)}")
         send_telegram(msg)
 
-print(f"--- STARTING SMC SCAN AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
+print(f"--- STARTING SMC SCAN (TWELVE DATA) AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
 for name, ticker_code in ASSETS.items():
     try:
         analyze_institutional_smc(name, ticker_code)
