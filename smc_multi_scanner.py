@@ -99,27 +99,27 @@ def fetch_twelve_data(symbol, interval, outputsize):
 def analyze_institutional_smc(symbol_name, symbol_code):
     print(f"\n--- Analyzing {symbol_name} ---")
 
-    # 1. Fetch 4H Macro Structure Data
-    df_4h = fetch_twelve_data(symbol_code, "4h", 40)
-    time.sleep(12)  # Delay keeps requests under 8/min rate limit
-
-    # 2. Fetch 1H Intermediate Structure Data
-    df_1h = fetch_twelve_data(symbol_code, "1h", 40)
-    time.sleep(12)
-
-    # 3. Fetch 15M Lower Timeframe Entry Data
-    df_15m = fetch_twelve_data(symbol_code, "15min", 40)
-    time.sleep(12)
-
-    if df_4h.empty or df_1h.empty or df_15m.empty:
-        print(f"⚠️ Skipping {symbol_name} due to incomplete candle data.")
-        return
-
-    # Skip Forex & Gold outside active Kill Zone hours
+    # Skip Forex & Gold outside active Kill Zone hours BEFORE making API calls
     if "BTC" not in symbol_name:
         if not is_in_killzone():
             print(f"⏳ {symbol_name}: Outside London/NY Kill Zone hours. Skipping...")
             return
+
+    # 1. Fetch 4H Macro Structure Data
+    df_4h = fetch_twelve_data(symbol_code, "4h", 40)
+    time.sleep(15)  # 15s delay guarantees under 4 calls/minute (safely under Twelve Data's 8 limit)
+
+    # 2. Fetch 1H Intermediate Structure Data
+    df_1h = fetch_twelve_data(symbol_code, "1h", 40)
+    time.sleep(15)
+
+    # 3. Fetch 15M Lower Timeframe Entry Data
+    df_15m = fetch_twelve_data(symbol_code, "15min", 40)
+    time.sleep(15)
+
+    if df_4h.empty or df_1h.empty or df_15m.empty:
+        print(f"⚠️ Skipping {symbol_name} due to incomplete candle data.")
+        return
 
     # --- TIER 1: 4H MACRO TREND & BREAK OF STRUCTURE (BOS) ---
     h4_swing_high = float(df_4h['High'].iloc[-15:-2].max())
@@ -185,7 +185,6 @@ def analyze_institutional_smc(symbol_name, symbol_code):
         direction = "INSTITUTIONAL BUY" if valid_buy else "INSTITUTIONAL SELL"
 
         # --- BALANCED STOP LOSS WITH ATR VOLATILITY BUFFER ---
-        # 0.5x ATR buffer protects against spread and lower-timeframe micro ticks
         sl_buffer = atr * 0.5
 
         if valid_buy:
@@ -199,7 +198,6 @@ def analyze_institutional_smc(symbol_name, symbol_code):
             tp_12 = c0_close - (risk * 2.0)
             tp_14 = c0_close - (risk * 4.0)
 
-        # Formatting precision according to asset class
         dec = 2 if ("XAU" in symbol_name or "BTC" in symbol_name or "JPY" in symbol_name) else 4
 
         msg = (f"⚡ HIGH-PRECISION SMC ALERT ⚡\n\n"
