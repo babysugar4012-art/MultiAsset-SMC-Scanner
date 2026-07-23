@@ -1,13 +1,13 @@
 import os
+import time
 import requests
 import pandas as pd
-from datetime import datetime, time
+from datetime import datetime, time as dt_time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# Symbol mapping for Twelve Data API
 ASSETS = {
     "EUR/USD": "EUR/USD",
     "XAU/USD (Gold)": "XAU/USD",
@@ -32,26 +32,25 @@ def send_telegram(message):
 
 def is_in_killzone():
     now_utc = datetime.utcnow().time()
-    return time(6, 0) <= now_utc <= time(20, 0)
+    return dt_time(6, 0) <= now_utc <= dt_time(20, 0)
 
 def fetch_twelve_data(symbol, interval, outputsize):
-    """Fetches clean OHLCV data from Twelve Data API."""
+    """Fetches clean OHLCV data from Twelve Data API with rate limit safety."""
     if not TWELVE_DATA_API_KEY:
-        print("❌ TWELVE_DATA_API_KEY environment variable missing!")
+        print("❌ TWELVE_DATA_API_KEY secret is missing in GitHub Settings!")
         return pd.DataFrame()
 
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         response = requests.get(url).json()
         if "values" not in response:
-            print(f"⚠️ Twelve Data Error for {symbol} ({interval}): {response.get('message', 'No values returned')}")
+            print(f"⚠️ Twelve Data Error for {symbol} ({interval}): {response.get('message', 'No data returned')}")
             return pd.DataFrame()
 
         df = pd.DataFrame(response["values"])
         df['datetime'] = pd.to_datetime(df['datetime'])
         df = df.sort_values('datetime').reset_index(drop=True)
         
-        # Convert numeric columns
         for col in ['open', 'high', 'low', 'close']:
             df[col] = df[col].astype(float)
             
@@ -62,12 +61,15 @@ def fetch_twelve_data(symbol, interval, outputsize):
         return pd.DataFrame()
 
 def analyze_institutional_smc(symbol_name, symbol_code):
-    # Fetch 4H (240m) and 15M candles from Twelve Data
+    # Fetch 4H and 15M candles with rate-limit pauses (8s delay)
     df_4h = fetch_twelve_data(symbol_code, "4h", 60)
+    time.sleep(8)
+    
     df_15m = fetch_twelve_data(symbol_code, "15min", 50)
+    time.sleep(8)
 
     if df_4h.empty or df_15m.empty:
-        print(f"⚠️ Skipping {symbol_name} due to missing data.")
+        print(f"⚠️ Skipping {symbol_name} due to missing or rate-limited data.")
         return
 
     # Skip Forex & Metals outside high-volume Kill Zones
@@ -127,12 +129,11 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob) and in_discount
     valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob) and in_premium
 
-    # PRINT LIVE STATUS TO GITHUB TERMINAL LOGS
     htf_str = "BULLISH" if htf_bullish else "BEARISH"
-    print(f"🔍 {symbol_name} | Live Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
+    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
 
     if valid_buy or valid_sell:
-        direction = "INSTITUTIONAL BUY (4H + OB + OTE)" if valid_buy else "INSTITUTIONAL SELL (4H + OB + OTE)"
+        direction = "INSTITUTIONAL BUY" if valid_buy else "INSTITUTIONAL SELL"
         sl = (c1_low - (atr * 0.2)) if valid_buy else (c1_high + (atr * 0.2))
         risk = abs(c0_close - sl)
         tp = (c0_close + (risk * 3.0)) if valid_buy else (c0_close - (risk * 3.0))
