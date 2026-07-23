@@ -8,7 +8,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# Free-tier supported assets on Twelve Data
 ASSETS = {
     "EUR/USD": "EUR/USD",
     "XAU/USD (Gold)": "XAU/USD",
@@ -61,15 +60,17 @@ def fetch_twelve_data(symbol, interval, outputsize):
         return pd.DataFrame()
 
 def analyze_institutional_smc(symbol_name, symbol_code):
-    # Fetch 4H and 15M candles with rate-limit pauses (8s delay)
-    df_4h = fetch_twelve_data(symbol_code, "4h", 60)
+    # Use 1H for Forex/Gold (Faster trend alignment), 4H for Crypto
+    htf_interval = "4h" if ("BTC" in symbol_name or "ETH" in symbol_name) else "1h"
+    
+    df_htf = fetch_twelve_data(symbol_code, htf_interval, 50)
     time.sleep(8)
     
     df_15m = fetch_twelve_data(symbol_code, "15min", 50)
     time.sleep(8)
 
-    if df_4h.empty or df_15m.empty:
-        print(f"⚠️ Skipping {symbol_name} due to missing or rate-limited data.")
+    if df_htf.empty or df_15m.empty:
+        print(f"⚠️ Skipping {symbol_name} due to missing data.")
         return
 
     # Skip Forex & Metals outside high-volume Kill Zones
@@ -78,15 +79,15 @@ def analyze_institutional_smc(symbol_name, symbol_code):
             print(f"⏳ {symbol_name}: Outside Kill Zone hours. Skipping...")
             return
 
-    # --- 1. 4H HTF BIAS ANALYSIS ---
-    htf_high = float(df_4h['High'].iloc[-20:-2].max())
-    htf_low = float(df_4h['Low'].iloc[-20:-2].min())
-    htf_close = float(df_4h['Close'].iloc[-1])
+    # --- 1. DYNAMIC HTF BIAS (1H / 4H) ---
+    htf_high = float(df_htf['High'].iloc[-15:-2].max())
+    htf_low = float(df_htf['Low'].iloc[-15:-2].min())
+    htf_close = float(df_htf['Close'].iloc[-1])
 
     htf_bullish = htf_close > (htf_high + htf_low) / 2
     htf_bearish = not htf_bullish
 
-    # --- 2. 15M LTF STRUCTURE & SWEEP ---
+    # --- 2. 15M TIGHT ENTRY & INVALIDATION STRUCT ---
     df_15m['ATR'] = (df_15m['High'] - df_15m['Low']).rolling(14).mean()
     
     c0_close = float(df_15m['Close'].iloc[-1])
@@ -104,51 +105,49 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     
     atr = float(df_15m['ATR'].iloc[-1])
 
-    swing_high_15m = float(df_15m['High'].iloc[-22:-2].max())
-    swing_low_15m = float(df_15m['Low'].iloc[-22:-2].min())
+    swing_high_15m = float(df_15m['High'].iloc[-18:-2].max())
+    swing_low_15m = float(df_15m['Low'].iloc[-18:-2].min())
 
+    # Sweeps & Displacement
     bull_sweep = (c1_low < swing_low_15m) and (c1_close > swing_low_15m)
     bear_sweep = (c1_high > swing_high_15m) and (c1_close < swing_high_15m)
 
-    bull_mss = bull_sweep and (c1_close > c2_high)
-    bear_mss = bear_sweep and (c1_close < c2_low)
+    bull_mss = bull_sweep or (c1_close > c2_high)
+    bear_mss = bear_sweep or (c1_close < c2_low)
 
     bull_fvg = c1_low > c3_high
     bear_fvg = c1_high < c3_low
 
-    bull_ob = (c2_close_val < c2_open) and bull_mss
-    bear_ob = (c2_close_val > c2_open) and bear_mss
+    bull_ob = (c2_close_val < c2_open) and (c1_close > c2_high)
+    bear_ob = (c2_close_val > c2_open) and (c1_close < c2_low)
 
-    swing_range = swing_high_15m - swing_low_15m
-    discount_level = swing_low_15m + (swing_range * 0.382)
-    premium_level = swing_high_15m - (swing_range * 0.382)
-
-    in_discount = c0_close <= discount_level
-    in_premium = c0_close >= premium_level
-
-    valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob) and in_discount
-    valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob) and in_premium
+    # Entry triggers: Trend + Structure Shift + (FVG or OB)
+    valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob)
+    valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob)
 
     htf_str = "BULLISH" if htf_bullish else "BEARISH"
-    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
+    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | {htf_interval.upper()} Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
 
     if valid_buy or valid_sell:
-        direction = "INSTITUTIONAL BUY" if valid_buy else "INSTITUTIONAL SELL"
-        sl = (c1_low - (atr * 0.2)) if valid_buy else (c1_high + (atr * 0.2))
+        direction = "INSTITUTIONAL BUY (1:4 RR)" if valid_buy else "INSTITUTIONAL SELL (1:4 RR)"
+        
+        # TIGHT STOP LOSS: Just beyond the invalidation candle low/high with tiny buffer
+        sl = (c1_low - (atr * 0.05)) if valid_buy else (c1_high + (atr * 0.05))
         risk = abs(c0_close - sl)
-        tp = (c0_close + (risk * 3.0)) if valid_buy else (c0_close - (risk * 3.0))
+        
+        # TARGET 1:4 RISK-TO-REWARD
+        tp_14 = (c0_close + (risk * 4.0)) if valid_buy else (c0_close - (risk * 4.0))
 
-        msg = (f"⚡ HIGH-CONFLUENCE SMC ALERT ⚡\n\n"
+        msg = (f"⚡ HIGH-PRECISION 1:4 SMC ALERT ⚡\n\n"
                f"Asset: {symbol_name}\nDirection: {direction}\nPrice: {round(c0_close, 4)}\n\n"
-               f"✓ 4H HTF Bias Confirmed\n"
-               f"✓ Kill Zone Volume Active\n"
-               f"✓ 15m Liquidity Sweep & MSS\n"
-               f"✓ Order Block / FVG Confluence\n"
-               f"✓ OTE Pricing ({'Discount Zone' if valid_buy else 'Premium Zone'})\n\n"
-               f"📍 Entry: {round(c0_close, 4)}\n🛡️ Stop Loss: {round(sl, 4)}\n🎯 Take Profit (1:3): {round(tp, 4)}")
+               f"✓ {htf_interval.upper()} Trend Aligned\n"
+               f"✓ Kill Zone Active\n"
+               f"✓ 15m Displacement / Structure Shift\n"
+               f"✓ Tight Invalidation Stop Applied\n\n"
+               f"📍 Entry: {round(c0_close, 4)}\n🛡️ Tight SL: {round(sl, 4)}\n🎯 Take Profit (1:4 RR): {round(tp_14, 4)}")
         send_telegram(msg)
 
-print(f"--- STARTING SMC SCAN (TWELVE DATA) AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
+print(f"--- STARTING SMC SCAN (1:4 RR OPTIMIZED) AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
 for name, ticker_code in ASSETS.items():
     try:
         analyze_institutional_smc(name, ticker_code)
