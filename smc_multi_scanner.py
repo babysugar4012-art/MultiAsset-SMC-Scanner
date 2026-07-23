@@ -94,22 +94,21 @@ def fetch_twelve_data(symbol, interval, outputsize):
         return pd.DataFrame()
 
 def analyze_institutional_smc(symbol_name, symbol_code):
-    # Dynamic HTF Selection: 4H for Crypto, 1H for Forex/Gold
     htf_interval = "4h" if ("BTC" in symbol_name or "ETH" in symbol_name) else "1h"
     
-    # 1. FETCH HTF DATA FOR MACRO TREND BIAS
+    # 1. FETCH HTF DATA (12s delay stays under free API limit of 8 calls/min)
     df_htf = fetch_twelve_data(symbol_code, htf_interval, 50)
-    time.sleep(8)
+    time.sleep(12)
     
-    # 2. FETCH 15M DATA FOR TIGHT ENTRY & INVALIDATION
+    # 2. FETCH 15M DATA
     df_15m = fetch_twelve_data(symbol_code, "15min", 50)
-    time.sleep(8)
+    time.sleep(12)
 
     if df_htf.empty or df_15m.empty:
         print(f"⚠️ Skipping {symbol_name} due to missing data.")
         return
 
-    # Skip Forex & Metals outside high-volume Kill Zones
+    # Skip Forex & Metals outside Kill Zone hours
     if "BTC" not in symbol_name:
         if not is_in_killzone():
             print(f"⏳ {symbol_name}: Outside Kill Zone hours. Skipping...")
@@ -157,7 +156,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     bull_ob = (c2_close_val < c2_open) and (c1_close > c2_high)
     bear_ob = (c2_close_val > c2_open) and (c1_close < c2_low)
 
-    # MTF Confluence: HTF Trend + 15m Displacement + (FVG or OB)
+    # MTF Confluence Check
     valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob)
     valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob)
 
@@ -169,12 +168,8 @@ def analyze_institutional_smc(symbol_name, symbol_code):
             return
 
         direction = "INSTITUTIONAL BUY (1:4 RR)" if valid_buy else "INSTITUTIONAL SELL (1:4 RR)"
-        
-        # Tight Invalidation Stop Loss (1-2 pips beyond sweep wick)
         sl = (c1_low - (atr * 0.05)) if valid_buy else (c1_high + (atr * 0.05))
         risk = abs(c0_close - sl)
-        
-        # Target 1:4 Take Profit
         tp_14 = (c0_close + (risk * 4.0)) if valid_buy else (c0_close - (risk * 4.0))
 
         msg = (f"⚡ HIGH-PRECISION 1:4 SMC ALERT ⚡\n\n"
