@@ -9,17 +9,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# HIGH-PROBABILITY INSTITUTIONAL SMC WATCHLIST
 ASSETS = {
     "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "AUD/USD": "AUD/USD",
+    "USD/CAD": "USD/CAD",
     "XAU/USD (Gold)": "XAU/USD",
-    "BTC/USD": "BTC/USD",
-    "ETH/USD": "ETH/USD",
-    "USD/JPY": "USD/JPY",
-    "GBP/JPY": "GBP/JPY"
+    "BTC/USD": "BTC/USD"
 }
 
 STATE_FILE = "last_alerts.json"
-COOLDOWN_HOURS = 2  # Don't repeat the same asset alert for 2 hours
+COOLDOWN_HOURS = 2  # Prevents duplicate alert spam for 2 hours
 
 def load_alert_history():
     if os.path.exists(STATE_FILE):
@@ -42,7 +43,7 @@ def should_send_alert(symbol_name):
     if symbol_name in history:
         last_time = datetime.fromisoformat(history[symbol_name])
         if datetime.utcnow() - last_time < timedelta(hours=COOLDOWN_HOURS):
-            print(f"⏳ {symbol_name}: Cooldown active. Sent alert recently ({last_time.strftime('%H:%M UTC')}). Skipping duplicate.")
+            print(f"⏳ {symbol_name}: Cooldown active. Alert sent recently ({last_time.strftime('%H:%M UTC')}). Skipping duplicate.")
             return False
     return True
 
@@ -93,11 +94,14 @@ def fetch_twelve_data(symbol, interval, outputsize):
         return pd.DataFrame()
 
 def analyze_institutional_smc(symbol_name, symbol_code):
+    # Dynamic HTF Selection: 4H for Crypto, 1H for Forex/Gold
     htf_interval = "4h" if ("BTC" in symbol_name or "ETH" in symbol_name) else "1h"
     
+    # 1. FETCH HTF DATA FOR MACRO TREND BIAS
     df_htf = fetch_twelve_data(symbol_code, htf_interval, 50)
     time.sleep(8)
     
+    # 2. FETCH 15M DATA FOR TIGHT ENTRY & INVALIDATION
     df_15m = fetch_twelve_data(symbol_code, "15min", 50)
     time.sleep(8)
 
@@ -105,12 +109,13 @@ def analyze_institutional_smc(symbol_name, symbol_code):
         print(f"⚠️ Skipping {symbol_name} due to missing data.")
         return
 
-    if "BTC" not in symbol_name and "ETH" not in symbol_name:
+    # Skip Forex & Metals outside high-volume Kill Zones
+    if "BTC" not in symbol_name:
         if not is_in_killzone():
             print(f"⏳ {symbol_name}: Outside Kill Zone hours. Skipping...")
             return
 
-    # 1. HTF BIAS
+    # --- MULTI-TIMEFRAME ANALYSIS STEP 1: HTF BIAS ---
     htf_high = float(df_htf['High'].iloc[-15:-2].max())
     htf_low = float(df_htf['Low'].iloc[-15:-2].min())
     htf_close = float(df_htf['Close'].iloc[-1])
@@ -118,7 +123,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     htf_bullish = htf_close > (htf_high + htf_low) / 2
     htf_bearish = not htf_bullish
 
-    # 2. LTF STRUCTURE
+    # --- MULTI-TIMEFRAME ANALYSIS STEP 2: 15M ENTRY & TIGHT STOP ---
     df_15m['ATR'] = (df_15m['High'] - df_15m['Low']).rolling(14).mean()
     
     c0_close = float(df_15m['Close'].iloc[-1])
@@ -139,6 +144,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     swing_high_15m = float(df_15m['High'].iloc[-18:-2].max())
     swing_low_15m = float(df_15m['Low'].iloc[-18:-2].min())
 
+    # Liquidity Sweeps & Market Structure Shifts (MSS)
     bull_sweep = (c1_low < swing_low_15m) and (c1_close > swing_low_15m)
     bear_sweep = (c1_high > swing_high_15m) and (c1_close < swing_high_15m)
 
@@ -151,6 +157,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     bull_ob = (c2_close_val < c2_open) and (c1_close > c2_high)
     bear_ob = (c2_close_val > c2_open) and (c1_close < c2_low)
 
+    # MTF Confluence: HTF Trend + 15m Displacement + (FVG or OB)
     valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob)
     valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob)
 
@@ -158,13 +165,16 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | {htf_interval.upper()} Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
 
     if valid_buy or valid_sell:
-        # CHECK FOR DUPLICATES BEFORE SENDING
         if not should_send_alert(symbol_name):
             return
 
         direction = "INSTITUTIONAL BUY (1:4 RR)" if valid_buy else "INSTITUTIONAL SELL (1:4 RR)"
+        
+        # Tight Invalidation Stop Loss (1-2 pips beyond sweep wick)
         sl = (c1_low - (atr * 0.05)) if valid_buy else (c1_high + (atr * 0.05))
         risk = abs(c0_close - sl)
+        
+        # Target 1:4 Take Profit
         tp_14 = (c0_close + (risk * 4.0)) if valid_buy else (c0_close - (risk * 4.0))
 
         msg = (f"⚡ HIGH-PRECISION 1:4 SMC ALERT ⚡\n\n"
@@ -178,7 +188,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
         send_telegram(msg)
         record_alert_sent(symbol_name)
 
-print(f"--- STARTING SMC SCAN AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
+print(f"--- STARTING MULTI-TIMEFRAME SMC SCAN AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
 for name, ticker_code in ASSETS.items():
     try:
         analyze_institutional_smc(name, ticker_code)
