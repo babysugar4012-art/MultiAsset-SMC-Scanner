@@ -8,14 +8,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# Free-tier supported assets on Twelve Data
 ASSETS = {
     "EUR/USD": "EUR/USD",
     "XAU/USD (Gold)": "XAU/USD",
     "BTC/USD": "BTC/USD",
     "ETH/USD": "ETH/USD",
     "USD/JPY": "USD/JPY",
-    "GBP/JPY": "GBP/JPY",
-    "XAG/USD (Silver)": "XAG/USD"
+    "GBP/JPY": "GBP/JPY"
 }
 
 def send_telegram(message):
