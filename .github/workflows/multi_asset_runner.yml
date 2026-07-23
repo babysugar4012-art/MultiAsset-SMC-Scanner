@@ -1,15 +1,15 @@
-name: Multi Asset SMC Scanner Runner
+name: Multi Asset SMC Scanner
 
 on:
-  push:
-    branches: [ main ]
   schedule:
+    # Runs every 15 minutes
     - cron: '*/15 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual trigger anytime
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -21,10 +21,12 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install yfinance pandas requests
+          python -m pip install --upgrade pip
+          pip install pandas requests
 
       - name: Execute Multi Asset SMC Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         run: python smc_multi_scanner.py
