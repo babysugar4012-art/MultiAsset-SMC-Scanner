@@ -39,6 +39,7 @@ def analyze_institutional_smc(symbol_name, ticker):
     df_15m = yf.download(ticker, period="5d", interval="15m", progress=False)
 
     if df_4h.empty or df_15m.empty:
+        print(f"⚠️ Could not fetch data for {symbol_name}")
         return
 
     # Handle multi-index columns from yfinance
@@ -53,6 +54,7 @@ def analyze_institutional_smc(symbol_name, ticker):
     # Skip Forex & Metals outside high-volume Kill Zones
     if "BTC" not in symbol_name and "ETH" not in symbol_name:
         if not is_in_killzone():
+            print(f"⏳ {symbol_name}: Outside Kill Zone hours. Skipping...")
             return
 
     # --- 1. 4H HTF BIAS ANALYSIS ---
@@ -106,6 +108,10 @@ def analyze_institutional_smc(symbol_name, ticker):
     valid_buy = htf_bullish and bull_mss and (bull_fvg or bull_ob) and in_discount
     valid_sell = htf_bearish and bear_mss and (bear_fvg or bear_ob) and in_premium
 
+    # PRINT LIVE STATUS TO GITHUB TERMINAL LOGS
+    htf_str = "BULLISH" if htf_bullish else "BEARISH"
+    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {htf_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
+
     if valid_buy or valid_sell:
         direction = "INSTITUTIONAL BUY (4H + OB + OTE)" if valid_buy else "INSTITUTIONAL SELL (4H + OB + OTE)"
         sl = (c1_low - (atr * 0.2)) if valid_buy else (c1_high + (atr * 0.2))
@@ -122,8 +128,10 @@ def analyze_institutional_smc(symbol_name, ticker):
                f"📍 Entry: {round(c0_close, 4)}\n🛡️ Stop Loss: {round(sl, 4)}\n🎯 Take Profit (1:3): {round(tp, 4)}")
         send_telegram(msg)
 
+print(f"--- STARTING SMC SCAN AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
 for name, ticker_code in ASSETS.items():
     try:
         analyze_institutional_smc(name, ticker_code)
     except Exception as e:
         print(f"Error processing {name}: {e}")
+print("--- SCAN COMPLETE ---")
