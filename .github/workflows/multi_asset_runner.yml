@@ -37,6 +37,10 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add last_alerts.json
-          git commit -m "Update alert history cooldown [skip ci]" || echo "No state changes to commit"
-          git push
+          if [ -f last_alerts.json ]; then
+            git add last_alerts.json
+            git commit -m "Update alert history cooldown [skip ci]" || echo "No changes to commit"
+            git push
+          else
+            echo "No last_alerts.json file created yet. Skipping commit."
+          fi
