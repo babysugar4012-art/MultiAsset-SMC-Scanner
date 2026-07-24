@@ -18,8 +18,16 @@ ASSETS = {
     "BTC/USD": "BTC/USD"
 }
 
+# MAXIMUM ALLOWED STOP LOSS CAP PER ASSET (Prevents Wide/Bloated SL)
+MAX_SL_CAPS = {
+    "EUR/USD": 0.0015,       # Max 15 pips
+    "USD/JPY": 0.18,         # Max 18 pips
+    "XAU/USD (Gold)": 4.50,  # Max $4.50 Gold distance
+    "BTC/USD": 180.0         # Max $180 BTC distance
+}
+
 STATE_FILE = "last_alerts.json"
-COOLDOWN_HOURS = 3  # 3-Hour cooldown window per pair to eliminate repeat signals
+COOLDOWN_HOURS = 3  # 3-Hour memory window per pair
 
 # --- STATE MANAGEMENT FOR COOLDOWN ---
 def load_alert_history():
@@ -34,7 +42,7 @@ def load_alert_history():
 def save_alert_history(history):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(history, f)
+            json.dump(history, f, indent=2)
     except Exception as e:
         print("Error saving state file:", e)
 
@@ -95,25 +103,23 @@ def fetch_twelve_data(symbol, interval, outputsize):
         print(f"Error fetching {symbol} from Twelve Data: {e}")
         return pd.DataFrame()
 
-# --- INSTITUTIONAL SMC ANALYSIS ENGINE ---
+# --- INSTITUTIONAL SMC OTE PRECISION ENGINE ---
 def analyze_institutional_smc(symbol_name, symbol_code):
     print(f"\n--- Analyzing {symbol_name} ---")
 
-    # Skip Forex & Gold outside active Kill Zone hours BEFORE making API calls
+    # Skip Forex & Gold outside active Kill Zone hours
     if "BTC" not in symbol_name:
         if not is_in_killzone():
             print(f"⏳ {symbol_name}: Outside London/NY Kill Zone hours. Skipping...")
             return
 
-    # 1. Fetch 4H Macro Structure Data
+    # 1. Fetch Data with Rate-Limit Padding (15s delay safely stays under Twelve Data limits)
     df_4h = fetch_twelve_data(symbol_code, "4h", 40)
-    time.sleep(15)  # 15s delay guarantees under 4 calls/minute (safely under Twelve Data's 8 limit)
+    time.sleep(15)
 
-    # 2. Fetch 1H Intermediate Structure Data
     df_1h = fetch_twelve_data(symbol_code, "1h", 40)
     time.sleep(15)
 
-    # 3. Fetch 15M Lower Timeframe Entry Data
     df_15m = fetch_twelve_data(symbol_code, "15min", 40)
     time.sleep(15)
 
@@ -121,7 +127,7 @@ def analyze_institutional_smc(symbol_name, symbol_code):
         print(f"⚠️ Skipping {symbol_name} due to incomplete candle data.")
         return
 
-    # --- TIER 1: 4H MACRO TREND & BREAK OF STRUCTURE (BOS) ---
+    # --- TIER 1: 4H MACRO TREND (BOS) ---
     h4_swing_high = float(df_4h['High'].iloc[-15:-2].max())
     h4_swing_low = float(df_4h['Low'].iloc[-15:-2].min())
     h4_close = float(df_4h['Close'].iloc[-1])
@@ -129,20 +135,19 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     h4_bullish = h4_close > h4_swing_high
     h4_bearish = h4_close < h4_swing_low
 
-    # Fallback to structural trend direction if no active BOS
     if not h4_bullish and not h4_bearish:
         h4_bullish = h4_close > (h4_swing_high + h4_swing_low) / 2
         h4_bearish = not h4_bullish
 
-    # --- TIER 2: 1H LIQUIDITY SWEEP & SUPPLY/DEMAND ---
+    # --- TIER 2: 1H LIQUIDITY & SUPPLY/DEMAND ---
     h1_swing_high = float(df_1h['High'].iloc[-12:-2].max())
     h1_swing_low = float(df_1h['Low'].iloc[-12:-2].min())
     h1_close = float(df_1h['Close'].iloc[-1])
 
-    h1_bsl_swept = float(df_1h['High'].iloc[-2]) > h1_swing_high  # Buy-side liquidity swept
-    h1_ssl_swept = float(df_1h['Low'].iloc[-2]) < h1_swing_low   # Sell-side liquidity swept
+    h1_bsl_swept = float(df_1h['High'].iloc[-2]) > h1_swing_high
+    h1_ssl_swept = float(df_1h['Low'].iloc[-2]) < h1_swing_low
 
-    # --- TIER 3: 15M DISPLACEMENT & MARKET STRUCTURE SHIFT (MSS) ---
+    # --- TIER 3: 15M DISPLACEMENT & OTE RETRACEMENT (0.705 FIB + FVG) ---
     df_15m['ATR'] = (df_15m['High'] - df_15m['Low']).rolling(14).mean()
     atr = float(df_15m['ATR'].iloc[-1])
 
@@ -159,24 +164,17 @@ def analyze_institutional_smc(symbol_name, symbol_code):
     c3_high = float(df_15m['High'].iloc[-4])
     c3_low = float(df_15m['Low'].iloc[-4])
 
-    m15_swing_high = float(df_15m['High'].iloc[-15:-2].max())
-    m15_swing_low = float(df_15m['Low'].iloc[-15:-2].min())
-
-    m15_bull_mss = (c1_close > m15_swing_high) or (c1_close > c2_high)
-    m15_bear_mss = (c1_close < m15_swing_low) or (c1_close < c2_low)
-
     m15_bull_fvg = c1_low > c3_high
     m15_bear_fvg = c1_high < c3_low
 
     m15_bull_ob = (c2_close_val < c2_open) and (c1_close > c2_high)
     m15_bear_ob = (c2_close_val > c2_open) and (c1_close < c2_low)
 
-    # STRICT 3-TIER CONFLUENCE CHECK
-    valid_buy = h4_bullish and (h1_ssl_swept or c0_close > h1_swing_low) and m15_bull_mss and (m15_bull_fvg or m15_bull_ob)
-    valid_sell = h4_bearish and (h1_bsl_swept or c0_close < h1_swing_high) and m15_bear_mss and (m15_bear_fvg or m15_bear_ob)
+    valid_buy = h4_bullish and (h1_ssl_swept or c0_close > h1_swing_low) and (m15_bull_fvg or m15_bull_ob)
+    valid_sell = h4_bearish and (h1_bsl_swept or c0_close < h1_swing_high) and (m15_bear_fvg or m15_bear_ob)
 
     h4_str = "BULLISH" if h4_bullish else "BEARISH"
-    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {h4_str} | Signal: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
+    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {h4_str} | Setup: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
 
     if valid_buy or valid_sell:
         if not should_send_alert(symbol_name):
@@ -184,30 +182,48 @@ def analyze_institutional_smc(symbol_name, symbol_code):
 
         direction = "INSTITUTIONAL BUY" if valid_buy else "INSTITUTIONAL SELL"
 
-        # --- BALANCED STOP LOSS WITH ATR VOLATILITY BUFFER ---
-        sl_buffer = atr * 0.5
+        # TIGHT OB WICK SL + MINIMAL ATR BUFFER
+        buffer = atr * 0.25
 
         if valid_buy:
-            raw_sl = m15_swing_low - sl_buffer
-            risk = abs(c0_close - raw_sl)
-            tp_12 = c0_close + (risk * 2.0)
-            tp_14 = c0_close + (risk * 4.0)
+            ob_wick = min(c2_low, c1_low)
+            tight_sl = ob_wick - buffer
+            impulse_low = min(c1_low, c0_close)
+            impulse_high = max(c2_high, c1_high)
+            # OTE Entry at 0.705 Fib level inside the FVG/OB Zone
+            ote_entry = impulse_high - ((impulse_high - impulse_low) * 0.705)
+            entry_price = min(c0_close, ote_entry)
+            risk = abs(entry_price - tight_sl)
+            tp_12 = entry_price + (risk * 2.0)
+            tp_14 = entry_price + (risk * 4.0)
         else:
-            raw_sl = m15_swing_high + sl_buffer
-            risk = abs(raw_sl - c0_close)
-            tp_12 = c0_close - (risk * 2.0)
-            tp_14 = c0_close - (risk * 4.0)
+            ob_wick = max(c2_high, c1_high)
+            tight_sl = ob_wick + buffer
+            impulse_high = max(c1_high, c0_close)
+            impulse_low = min(c2_low, c1_low)
+            # OTE Entry at 0.705 Fib level
+            ote_entry = impulse_low + ((impulse_high - impulse_low) * 0.705)
+            entry_price = max(c0_close, ote_entry)
+            risk = abs(tight_sl - entry_price)
+            tp_12 = entry_price - (risk * 2.0)
+            tp_14 = entry_price - (risk * 4.0)
+
+        # CHECK SL AGAINST MAXIMUM ALLOWED SL CAP
+        max_cap = MAX_SL_CAPS.get(symbol_name, 9999)
+        if risk > max_cap:
+            print(f"⚠️ {symbol_name}: Risk ({risk:.4f}) exceeds Max Cap ({max_cap}). Discarding wide setup.")
+            return
 
         dec = 2 if ("XAU" in symbol_name or "BTC" in symbol_name or "JPY" in symbol_name) else 4
 
-        msg = (f"⚡ HIGH-PRECISION SMC ALERT ⚡\n\n"
-               f"Asset: {symbol_name}\nDirection: {direction}\nPrice: {round(c0_close, dec)}\n\n"
+        msg = (f"⚡ HIGH-PRECISION SMC OTE ALERT ⚡\n\n"
+               f"Asset: {symbol_name}\nDirection: {direction}\n\n"
                f"✓ 4H Trend Aligned ({h4_str})\n"
-               f"✓ 1H Liquidity & Order Block Filter Active\n"
-               f"✓ 15m Displacement / MSS Confirmed\n"
-               f"✓ Structural SL + Volatility Buffer Applied\n\n"
-               f"📍 Entry: {round(c0_close, dec)}\n"
-               f"🛡️ Dynamic SL: {round(raw_sl, dec)}\n"
+               f"✓ 1H Liquidity & OB Active\n"
+               f"✓ 15m OTE (0.705 Fib + FVG) Precision Entry\n"
+               f"✓ Tight OB Wick SL Applied\n\n"
+               f"📍 Entry Level: {round(entry_price, dec)}\n"
+               f"🛡️ Tight SL: {round(tight_sl, dec)} (Risk: {round(risk, dec)})\n"
                f"🎯 TP1 (1:2 RR - Move SL to BE): {round(tp_12, dec)}\n"
                f"🎯 TP2 (1:4 RR - Main Target): {round(tp_14, dec)}")
         
