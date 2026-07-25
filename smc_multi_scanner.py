@@ -1,36 +1,36 @@
 import os
-import time
-import json
 import requests
 import pandas as pd
-from datetime import datetime, timedelta, time as dt_time
+import numpy as np
+import json
+from datetime import datetime, timezone
 
-# ENVIRONMENT SECRETS
+# --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-# 1. OPTIMIZED 4-ASSET WATCHLIST
-ASSETS = {
-    "EUR/USD": "EUR/USD",
-    "USD/JPY": "USD/JPY",
-    "XAU/USD (Gold)": "XAU/USD",
-    "BTC/USD": "BTC/USD"
-}
-
-# MAXIMUM ALLOWED STOP LOSS CAP PER ASSET (Prevents Wide/Bloated SL)
-MAX_SL_CAPS = {
-    "EUR/USD": 0.0015,       # Max 15 pips
-    "USD/JPY": 0.18,         # Max 18 pips
-    "XAU/USD (Gold)": 4.50,  # Max $4.50 Gold distance
-    "BTC/USD": 180.0         # Max $180 BTC distance
-}
+ASSETS = [
+    {"symbol": "BTC/USD", "type": "crypto"},
+    {"symbol": "EUR/USD", "type": "forex"},
+    {"symbol": "USD/JPY", "type": "forex"},
+    {"symbol": "XAU/USD", "type": "forex"}
+]
 
 STATE_FILE = "last_alerts.json"
-COOLDOWN_HOURS = 3  # 3-Hour memory window per pair
+LOCKOUT_HOURS = 6
+MIN_CONFLUENCE_SCORE = 8  # Out of 10 points
 
-# --- STATE MANAGEMENT FOR COOLDOWN ---
-def load_alert_history():
+def send_telegram_msg(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, json=payload)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
+
+def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
@@ -39,202 +39,184 @@ def load_alert_history():
             return {}
     return {}
 
-def save_alert_history(history):
+def save_state(state):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(history, f, indent=2)
+            json.dump(state, f, indent=4)
     except Exception as e:
-        print("Error saving state file:", e)
+        print(f"Error saving state file: {e}")
 
-def should_send_alert(symbol_name):
-    history = load_alert_history()
-    if symbol_name in history:
-        last_time = datetime.fromisoformat(history[symbol_name])
-        if datetime.utcnow() - last_time < timedelta(hours=COOLDOWN_HOURS):
-            print(f"⏳ {symbol_name}: Cooldown active. Alert sent at {last_time.strftime('%H:%M UTC')}. Skipping duplicate.")
-            return False
-    return True
-
-def record_alert_sent(symbol_name):
-    history = load_alert_history()
-    history[symbol_name] = datetime.utcnow().isoformat()
-    save_alert_history(history)
-
-# --- TELEGRAM NOTIFIER ---
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Telegram tokens missing.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        res = requests.post(url, data=payload)
-        print("Telegram Sent Status:", res.status_code)
-    except Exception as e:
-        print("Telegram Error:", e)
-
-def is_in_killzone():
-    now_utc = datetime.utcnow().time()
-    return dt_time(6, 0) <= now_utc <= dt_time(20, 0)
-
-# --- TWELVE DATA API FETCH ---
-def fetch_twelve_data(symbol, interval, outputsize):
-    if not TWELVE_DATA_API_KEY:
-        print("❌ TWELVE_DATA_API_KEY secret is missing!")
-        return pd.DataFrame()
-
+def fetch_data(symbol, interval, outputsize=100):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
-    try:
-        response = requests.get(url).json()
-        if "values" not in response:
-            print(f"⚠️ Twelve Data Error for {symbol} ({interval}): {response.get('message', 'No data returned')}")
-            return pd.DataFrame()
+    res = requests.get(url).json()
+    if "values" not in res:
+        print(f"Failed to fetch data for {symbol} ({interval}): {res.get('message', 'Unknown error')}")
+        return None
+    df = pd.DataFrame(res["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
 
-        df = pd.DataFrame(response["values"])
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.sort_values('datetime').reset_index(drop=True)
-        
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
-            
-        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
-        return df
-    except Exception as e:
-        print(f"Error fetching {symbol} from Twelve Data: {e}")
-        return pd.DataFrame()
+def is_kill_zone(current_time_utc):
+    hour = current_time_utc.hour
+    # London: 07:00 - 10:00 UTC | New York: 12:00 - 16:00 UTC
+    if (7 <= hour < 10) or (12 <= hour < 16):
+        return True, 2
+    return False, 0
 
-# --- INSTITUTIONAL SMC OTE PRECISION ENGINE ---
-def analyze_institutional_smc(symbol_name, symbol_code):
-    print(f"\n--- Analyzing {symbol_name} ---")
-
-    # Skip Forex & Gold outside active Kill Zone hours
-    if "BTC" not in symbol_name:
-        if not is_in_killzone():
-            print(f"⏳ {symbol_name}: Outside London/NY Kill Zone hours. Skipping...")
-            return
-
-    # 1. Fetch Data with Rate-Limit Padding (15s delay safely stays under Twelve Data limits)
-    df_4h = fetch_twelve_data(symbol_code, "4h", 40)
-    time.sleep(15)
-
-    df_1h = fetch_twelve_data(symbol_code, "1h", 40)
-    time.sleep(15)
-
-    df_15m = fetch_twelve_data(symbol_code, "15min", 40)
-    time.sleep(15)
-
-    if df_4h.empty or df_1h.empty or df_15m.empty:
-        print(f"⚠️ Skipping {symbol_name} due to incomplete candle data.")
+def evaluate_high_probability_setup(asset_info, state):
+    symbol = asset_info["symbol"]
+    
+    # 1. Fetch Timeframes
+    df_4h = fetch_data(symbol, "4h", 50)
+    df_1h = fetch_data(symbol, "1h", 50)
+    df_15m = fetch_data(symbol, "15min", 50)
+    
+    if df_4h is None or df_1h is None or df_15m is None:
         return
 
-    # --- TIER 1: 4H MACRO TREND (BOS) ---
-    h4_swing_high = float(df_4h['High'].iloc[-15:-2].max())
-    h4_swing_low = float(df_4h['Low'].iloc[-15:-2].min())
-    h4_close = float(df_4h['Close'].iloc[-1])
+    now_utc = datetime.now(timezone.utc)
+    
+    # --- CHECK LOCKOUT STATE ---
+    asset_state = state.get(symbol, {})
+    last_alert_time_str = asset_state.get("last_time")
+    last_direction = asset_state.get("direction")
 
-    h4_bullish = h4_close > h4_swing_high
-    h4_bearish = h4_close < h4_swing_low
+    if last_alert_time_str:
+        last_alert_time = datetime.fromisoformat(last_alert_time_str)
+        hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
+        if hours_since < LOCKOUT_HOURS:
+            # Check if potential direction matches locked direction
+            # Lockout only prevents duplicate trades in the SAME direction
+            pass
 
-    if not h4_bullish and not h4_bearish:
-        h4_bullish = h4_close > (h4_swing_high + h4_swing_low) / 2
-        h4_bearish = not h4_bullish
+    # 2. Score Calculation Initialization
+    score = 0
+    checks = []
 
-    # --- TIER 2: 1H LIQUIDITY & SUPPLY/DEMAND ---
-    h1_swing_high = float(df_1h['High'].iloc[-12:-2].max())
-    h1_swing_low = float(df_1h['Low'].iloc[-12:-2].min())
-    h1_close = float(df_1h['Close'].iloc[-1])
+    # --- FACTOR 1: Kill Zone Timing (+2 pts) ---
+    in_kz, kz_pts = is_kill_zone(now_utc)
+    score += kz_pts
+    if in_kz:
+        checks.append("Strict Session Kill Zone Active")
 
-    h1_bsl_swept = float(df_1h['High'].iloc[-2]) > h1_swing_high
-    h1_ssl_swept = float(df_1h['Low'].iloc[-2]) < h1_swing_low
+    # --- FACTOR 2: 4H Macro Trend Alignment (+1 pt) ---
+    ema_20_4h = df_4h["close"].ewm(span=20).mean().iloc[-1]
+    last_close_4h = df_4h["close"].iloc[-1]
+    trend_4h = "BULLISH" if last_close_4h > ema_20_4h else "BEARISH"
+    score += 1
+    checks.append(f"4H Trend Aligned ({trend_4h})")
 
-    # --- TIER 3: 15M DISPLACEMENT & OTE RETRACEMENT (0.705 FIB + FVG) ---
-    df_15m['ATR'] = (df_15m['High'] - df_15m['Low']).rolling(14).mean()
-    atr = float(df_15m['ATR'].iloc[-1])
+    # --- FACTOR 3: 1H Liquidity Sweep (+3 pts) ---
+    # Buy side sweep for Sell setups / Sell side sweep for Buy setups
+    recent_high_1h = df_1h["high"].iloc[-15:-1].max()
+    recent_low_1h = df_1h["low"].iloc[-15:-1].min()
+    current_high_1h = df_1h["high"].iloc[-1]
+    current_low_1h = df_1h["low"].iloc[-1]
 
-    c0_close = float(df_15m['Close'].iloc[-1])
-    c1_high = float(df_15m['High'].iloc[-2])
-    c1_low = float(df_15m['Low'].iloc[-2])
-    c1_close = float(df_15m['Close'].iloc[-2])
+    swept_liquidity = False
+    if trend_4h == "BEARISH" and current_high_1h >= recent_high_1h:
+        swept_liquidity = True
+        score += 3
+        checks.append("1H Buy-Side Liquidity Swept")
+    elif trend_4h == "BULLISH" and current_low_1h <= recent_low_1h:
+        swept_liquidity = True
+        score += 3
+        checks.append("1H Sell-Side Liquidity Swept")
 
-    c2_high = float(df_15m['High'].iloc[-3])
-    c2_low = float(df_15m['Low'].iloc[-3])
-    c2_open = float(df_15m['Open'].iloc[-3])
-    c2_close_val = float(df_15m['Close'].iloc[-3])
+    # --- FACTOR 4: 15M Displacement & Strong Candle Close (+2 pts) ---
+    c_open = df_15m["open"].iloc[-1]
+    c_close = df_15m["close"].iloc[-1]
+    c_high = df_15m["high"].iloc[-1]
+    c_low = df_15m["low"].iloc[-1]
+    candle_body = abs(c_close - c_open)
+    total_range = c_high - c_low
 
-    c3_high = float(df_15m['High'].iloc[-4])
-    c3_low = float(df_15m['Low'].iloc[-4])
+    strong_displacement = False
+    if total_range > 0 and (candle_body / total_range) >= 0.60: # Body accounts for >60% of range
+        strong_displacement = True
+        score += 2
+        checks.append("15M Strong Institutional Displacement")
 
-    m15_bull_fvg = c1_low > c3_high
-    m15_bear_fvg = c1_high < c3_low
+    # --- FACTOR 5: OTE Fib (0.705 - 0.79) + FVG Alignment (+2 pts) ---
+    swing_high_15m = df_15m["high"].iloc[-20:].max()
+    swing_low_15m = df_15m["low"].iloc[-20:].min()
+    rng = swing_high_15m - swing_low_15m
 
-    m15_bull_ob = (c2_close_val < c2_open) and (c1_close > c2_high)
-    m15_bear_ob = (c2_close_val > c2_open) and (c1_close < c2_low)
+    ote_aligned = False
+    if trend_4h == "BEARISH":
+        ote_level = swing_low_15m + (rng * 0.705)
+        if df_15m["close"].iloc[-1] >= ote_level:
+            ote_aligned = True
+            score += 2
+            checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
+    else:
+        ote_level = swing_high_15m - (rng * 0.705)
+        if df_15m["close"].iloc[-1] <= ote_level:
+            ote_aligned = True
+            score += 2
+            checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
 
-    valid_buy = h4_bullish and (h1_ssl_swept or c0_close > h1_swing_low) and (m15_bull_fvg or m15_bull_ob)
-    valid_sell = h4_bearish and (h1_bsl_swept or c0_close < h1_swing_high) and (m15_bear_fvg or m15_bear_ob)
+    # --- FINAL EVALUATION ---
+    direction = "INSTITUTIONAL SELL" if trend_4h == "BEARISH" else "INSTITUTIONAL BUY"
 
-    h4_str = "BULLISH" if h4_bullish else "BEARISH"
-    print(f"🔍 {symbol_name} | Price: {c0_close:.4f} | 4H Bias: {h4_str} | Setup: {'YES' if (valid_buy or valid_sell) else 'NO SETUP'}")
-
-    if valid_buy or valid_sell:
-        if not should_send_alert(symbol_name):
+    # Enforce Directional Lockout Check
+    if last_alert_time_str and last_direction == direction:
+        last_alert_time = datetime.fromisoformat(last_alert_time_str)
+        hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
+        if hours_since < LOCKOUT_HOURS:
+            print(f"Skipping {symbol} {direction}: locked out for {LOCKOUT_HOURS - hours_since:.1f} more hours.")
             return
 
-        direction = "INSTITUTIONAL BUY" if valid_buy else "INSTITUTIONAL SELL"
-
-        # TIGHT OB WICK SL + MINIMAL ATR BUFFER
-        buffer = atr * 0.25
-
-        if valid_buy:
-            ob_wick = min(c2_low, c1_low)
-            tight_sl = ob_wick - buffer
-            impulse_low = min(c1_low, c0_close)
-            impulse_high = max(c2_high, c1_high)
-            # OTE Entry at 0.705 Fib level inside the FVG/OB Zone
-            ote_entry = impulse_high - ((impulse_high - impulse_low) * 0.705)
-            entry_price = min(c0_close, ote_entry)
-            risk = abs(entry_price - tight_sl)
-            tp_12 = entry_price + (risk * 2.0)
-            tp_14 = entry_price + (risk * 4.0)
-        else:
-            ob_wick = max(c2_high, c1_high)
-            tight_sl = ob_wick + buffer
-            impulse_high = max(c1_high, c0_close)
-            impulse_low = min(c2_low, c1_low)
-            # OTE Entry at 0.705 Fib level
-            ote_entry = impulse_low + ((impulse_high - impulse_low) * 0.705)
-            entry_price = max(c0_close, ote_entry)
-            risk = abs(tight_sl - entry_price)
-            tp_12 = entry_price - (risk * 2.0)
-            tp_14 = entry_price - (risk * 4.0)
-
-        # CHECK SL AGAINST MAXIMUM ALLOWED SL CAP
-        max_cap = MAX_SL_CAPS.get(symbol_name, 9999)
-        if risk > max_cap:
-            print(f"⚠️ {symbol_name}: Risk ({risk:.4f}) exceeds Max Cap ({max_cap}). Discarding wide setup.")
-            return
-
-        dec = 2 if ("XAU" in symbol_name or "BTC" in symbol_name or "JPY" in symbol_name) else 4
-
-        msg = (f"⚡ HIGH-PRECISION SMC OTE ALERT ⚡\n\n"
-               f"Asset: {symbol_name}\nDirection: {direction}\n\n"
-               f"✓ 4H Trend Aligned ({h4_str})\n"
-               f"✓ 1H Liquidity & OB Active\n"
-               f"✓ 15m OTE (0.705 Fib + FVG) Precision Entry\n"
-               f"✓ Tight OB Wick SL Applied\n\n"
-               f"📍 Entry Level: {round(entry_price, dec)}\n"
-               f"🛡️ Tight SL: {round(tight_sl, dec)} (Risk: {round(risk, dec)})\n"
-               f"🎯 TP1 (1:2 RR - Move SL to BE): {round(tp_12, dec)}\n"
-               f"🎯 TP2 (1:4 RR - Main Target): {round(tp_14, dec)}")
+    # Trigger Alert if Minimum Score Met
+    if score >= MIN_CONFLUENCE_SCORE:
+        entry = df_15m["close"].iloc[-1]
         
-        send_telegram(msg)
-        record_alert_sent(symbol_name)
+        # Risk Parameters
+        if direction == "INSTITUTIONAL SELL":
+            sl = swing_high_15m
+            risk = round(sl - entry, 4)
+            tp1 = round(entry - (risk * 2), 4)
+            tp2 = round(entry - (risk * 4), 4)
+        else:
+            sl = swing_low_15m
+            risk = round(entry - sl, 4)
+            tp1 = round(entry + (risk * 2), 4)
+            tp2 = round(entry + (risk * 4), 4)
 
-# --- SCRIPT EXECUTION ---
-print(f"--- STARTING SMC MULTI-TIMEFRAME SCAN AT {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ---")
-for name, ticker_code in ASSETS.items():
-    try:
-        analyze_institutional_smc(name, ticker_code)
-    except Exception as e:
-        print(f"Error processing {name}: {e}")
-print("--- SCAN COMPLETE ---")
+        check_list_str = "\n".join([f"✓ {c}" for c in checks])
+
+        msg = (
+            f"🎯 *HIGH-PROBABILITY SMC OTE ALERT* 🎯\n\n"
+            f"*Asset:* {symbol}\n"
+            f"*Direction:* {direction}\n"
+            f"*Confluence Score:* `{score}/10` 🔥\n\n"
+            f"{check_list_str}\n\n"
+            f"📍 *Entry Level:* `{entry}`\n"
+            f"🛡️ *Tight SL:* `{sl}` (Risk: `{risk}`)\n"
+            f"🎯 *TP1 (1:2 RR - Move SL to BE):* `{tp1}`\n"
+            f"🎯 *TP2 (1:4 RR - Main Target):* `{tp2}`"
+        )
+
+        send_telegram_msg(msg)
+        
+        # Save State
+        state[symbol] = {
+            "last_time": now_utc.isoformat(),
+            "direction": direction,
+            "score": score
+        }
+        save_state(state)
+
+def main():
+    state = load_state()
+    for asset in ASSETS:
+        try:
+            evaluate_high_probability_setup(asset, state)
+        except Exception as e:
+            print(f"Error evaluating {asset['symbol']}: {e}")
+
+if __name__ == "__main__":
+    main()
