@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 import json
+import time
 from datetime import datetime, timezone
 
 # --- CONFIGURATION ---
@@ -47,11 +48,21 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 def fetch_data(symbol, interval, outputsize=100):
+    # TwelveData Rate Limit Safety Delay
+    time.sleep(8.5)
+    
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
-    res = requests.get(url).json()
-    if "values" not in res:
-        print(f"Failed to fetch data for {symbol} ({interval}): {res.get('message', 'Unknown error')}")
+    try:
+        res = requests.get(url).json()
+    except Exception as e:
+        print(f"Failed HTTP request for {symbol} ({interval}): {e}")
         return None
+
+    if not isinstance(res, dict) or "values" not in res:
+        err_msg = res.get("message") if isinstance(res, dict) else str(res)
+        print(f"Failed to fetch data for {symbol} ({interval}): {err_msg}")
+        return None
+
     df = pd.DataFrame(res["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
@@ -75,22 +86,18 @@ def evaluate_high_probability_setup(asset_info, state):
     df_15m = fetch_data(symbol, "15min", 50)
     
     if df_4h is None or df_1h is None or df_15m is None:
+        print(f"Skipping evaluation for {symbol} due to missing timeframe data.")
         return
 
     now_utc = datetime.now(timezone.utc)
     
     # --- CHECK LOCKOUT STATE ---
     asset_state = state.get(symbol, {})
+    if not isinstance(asset_state, dict):
+        asset_state = {}
+
     last_alert_time_str = asset_state.get("last_time")
     last_direction = asset_state.get("direction")
-
-    if last_alert_time_str:
-        last_alert_time = datetime.fromisoformat(last_alert_time_str)
-        hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
-        if hours_since < LOCKOUT_HOURS:
-            # Check if potential direction matches locked direction
-            # Lockout only prevents duplicate trades in the SAME direction
-            pass
 
     # 2. Score Calculation Initialization
     score = 0
@@ -105,24 +112,20 @@ def evaluate_high_probability_setup(asset_info, state):
     # --- FACTOR 2: 4H Macro Trend Alignment (+1 pt) ---
     ema_20_4h = df_4h["close"].ewm(span=20).mean().iloc[-1]
     last_close_4h = df_4h["close"].iloc[-1]
-    trend_4h = "BULLISH" if last_close_4h > ema_20_4h else "BEARISH"
+    trend_4h = "BEARISH" if last_close_4h < ema_20_4h else "BULLISH"
     score += 1
     checks.append(f"4H Trend Aligned ({trend_4h})")
 
     # --- FACTOR 3: 1H Liquidity Sweep (+3 pts) ---
-    # Buy side sweep for Sell setups / Sell side sweep for Buy setups
     recent_high_1h = df_1h["high"].iloc[-15:-1].max()
     recent_low_1h = df_1h["low"].iloc[-15:-1].min()
     current_high_1h = df_1h["high"].iloc[-1]
     current_low_1h = df_1h["low"].iloc[-1]
 
-    swept_liquidity = False
     if trend_4h == "BEARISH" and current_high_1h >= recent_high_1h:
-        swept_liquidity = True
         score += 3
         checks.append("1H Buy-Side Liquidity Swept")
     elif trend_4h == "BULLISH" and current_low_1h <= recent_low_1h:
-        swept_liquidity = True
         score += 3
         checks.append("1H Sell-Side Liquidity Swept")
 
@@ -134,9 +137,7 @@ def evaluate_high_probability_setup(asset_info, state):
     candle_body = abs(c_close - c_open)
     total_range = c_high - c_low
 
-    strong_displacement = False
-    if total_range > 0 and (candle_body / total_range) >= 0.60: # Body accounts for >60% of range
-        strong_displacement = True
+    if total_range > 0 and (candle_body / total_range) >= 0.60:
         score += 2
         checks.append("15M Strong Institutional Displacement")
 
@@ -145,36 +146,34 @@ def evaluate_high_probability_setup(asset_info, state):
     swing_low_15m = df_15m["low"].iloc[-20:].min()
     rng = swing_high_15m - swing_low_15m
 
-    ote_aligned = False
     if trend_4h == "BEARISH":
         ote_level = swing_low_15m + (rng * 0.705)
         if df_15m["close"].iloc[-1] >= ote_level:
-            ote_aligned = True
             score += 2
             checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
     else:
         ote_level = swing_high_15m - (rng * 0.705)
         if df_15m["close"].iloc[-1] <= ote_level:
-            ote_aligned = True
             score += 2
             checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
 
-    # --- FINAL EVALUATION ---
     direction = "INSTITUTIONAL SELL" if trend_4h == "BEARISH" else "INSTITUTIONAL BUY"
 
     # Enforce Directional Lockout Check
     if last_alert_time_str and last_direction == direction:
-        last_alert_time = datetime.fromisoformat(last_alert_time_str)
-        hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
-        if hours_since < LOCKOUT_HOURS:
-            print(f"Skipping {symbol} {direction}: locked out for {LOCKOUT_HOURS - hours_since:.1f} more hours.")
-            return
+        try:
+            last_alert_time = datetime.fromisoformat(last_alert_time_str)
+            hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
+            if hours_since < LOCKOUT_HOURS:
+                print(f"Skipping {symbol} {direction}: locked out for {LOCKOUT_HOURS - hours_since:.1f} more hours.")
+                return
+        except Exception:
+            pass
 
     # Trigger Alert if Minimum Score Met
     if score >= MIN_CONFLUENCE_SCORE:
         entry = df_15m["close"].iloc[-1]
         
-        # Risk Parameters
         if direction == "INSTITUTIONAL SELL":
             sl = swing_high_15m
             risk = round(sl - entry, 4)
@@ -202,7 +201,6 @@ def evaluate_high_probability_setup(asset_info, state):
 
         send_telegram_msg(msg)
         
-        # Save State
         state[symbol] = {
             "last_time": now_utc.isoformat(),
             "direction": direction,
