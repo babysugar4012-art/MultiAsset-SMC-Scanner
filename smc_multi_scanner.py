@@ -48,19 +48,17 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 def fetch_data(symbol, interval, outputsize=100):
-    # TwelveData Rate Limit Safety Delay
-    time.sleep(8.5)
-    
+    time.sleep(8.5) # Rate limit safety for TwelveData
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = requests.get(url).json()
     except Exception as e:
-        print(f"Failed HTTP request for {symbol} ({interval}): {e}")
+        print(f"  ❌ HTTP error fetching {symbol} ({interval}): {e}")
         return None
 
     if not isinstance(res, dict) or "values" not in res:
         err_msg = res.get("message") if isinstance(res, dict) else str(res)
-        print(f"Failed to fetch data for {symbol} ({interval}): {err_msg}")
+        print(f"  ❌ API error for {symbol} ({interval}): {err_msg}")
         return None
 
     df = pd.DataFrame(res["values"])
@@ -72,13 +70,13 @@ def fetch_data(symbol, interval, outputsize=100):
 
 def is_kill_zone(current_time_utc):
     hour = current_time_utc.hour
-    # London: 07:00 - 10:00 UTC | New York: 12:00 - 16:00 UTC
     if (7 <= hour < 10) or (12 <= hour < 16):
         return True, 2
     return False, 0
 
 def evaluate_high_probability_setup(asset_info, state):
     symbol = asset_info["symbol"]
+    print(f"\n🔍 [EVALUATING]: {symbol}...")
     
     # 1. Fetch Timeframes
     df_4h = fetch_data(symbol, "4h", 50)
@@ -86,7 +84,7 @@ def evaluate_high_probability_setup(asset_info, state):
     df_15m = fetch_data(symbol, "15min", 50)
     
     if df_4h is None or df_1h is None or df_15m is None:
-        print(f"Skipping evaluation for {symbol} due to missing timeframe data.")
+        print(f"  ⚠️ Skipped {symbol}: Could not retrieve complete timeframe data.")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -99,24 +97,23 @@ def evaluate_high_probability_setup(asset_info, state):
     last_alert_time_str = asset_state.get("last_time")
     last_direction = asset_state.get("direction")
 
-    # 2. Score Calculation Initialization
     score = 0
     checks = []
 
-    # --- FACTOR 1: Kill Zone Timing (+2 pts) ---
+    # Factor 1: Kill Zone Timing (+2)
     in_kz, kz_pts = is_kill_zone(now_utc)
     score += kz_pts
     if in_kz:
         checks.append("Strict Session Kill Zone Active")
 
-    # --- FACTOR 2: 4H Macro Trend Alignment (+1 pt) ---
+    # Factor 2: 4H Macro Trend (+1)
     ema_20_4h = df_4h["close"].ewm(span=20).mean().iloc[-1]
     last_close_4h = df_4h["close"].iloc[-1]
     trend_4h = "BEARISH" if last_close_4h < ema_20_4h else "BULLISH"
     score += 1
     checks.append(f"4H Trend Aligned ({trend_4h})")
 
-    # --- FACTOR 3: 1H Liquidity Sweep (+3 pts) ---
+    # Factor 3: 1H Liquidity Sweep (+3)
     recent_high_1h = df_1h["high"].iloc[-15:-1].max()
     recent_low_1h = df_1h["low"].iloc[-15:-1].min()
     current_high_1h = df_1h["high"].iloc[-1]
@@ -129,7 +126,7 @@ def evaluate_high_probability_setup(asset_info, state):
         score += 3
         checks.append("1H Sell-Side Liquidity Swept")
 
-    # --- FACTOR 4: 15M Displacement & Strong Candle Close (+2 pts) ---
+    # Factor 4: 15M Displacement (+2)
     c_open = df_15m["open"].iloc[-1]
     c_close = df_15m["close"].iloc[-1]
     c_high = df_15m["high"].iloc[-1]
@@ -141,7 +138,7 @@ def evaluate_high_probability_setup(asset_info, state):
         score += 2
         checks.append("15M Strong Institutional Displacement")
 
-    # --- FACTOR 5: OTE Fib (0.705 - 0.79) + FVG Alignment (+2 pts) ---
+    # Factor 5: OTE Fib + FVG (+2)
     swing_high_15m = df_15m["high"].iloc[-20:].max()
     swing_low_15m = df_15m["low"].iloc[-20:].min()
     rng = swing_high_15m - swing_low_15m
@@ -159,21 +156,21 @@ def evaluate_high_probability_setup(asset_info, state):
 
     direction = "INSTITUTIONAL SELL" if trend_4h == "BEARISH" else "INSTITUTIONAL BUY"
 
-    # Enforce Directional Lockout Check
+    print(f"  📊 Confluence Score: {score}/10 ({len(checks)} checks passed)")
+
+    # Lockout check
     if last_alert_time_str and last_direction == direction:
         try:
             last_alert_time = datetime.fromisoformat(last_alert_time_str)
             hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
             if hours_since < LOCKOUT_HOURS:
-                print(f"Skipping {symbol} {direction}: locked out for {LOCKOUT_HOURS - hours_since:.1f} more hours.")
+                print(f"  🛑 Lockout Active for {symbol} ({direction}): {LOCKOUT_HOURS - hours_since:.1f} hours remaining.")
                 return
         except Exception:
             pass
 
-    # Trigger Alert if Minimum Score Met
     if score >= MIN_CONFLUENCE_SCORE:
         entry = df_15m["close"].iloc[-1]
-        
         if direction == "INSTITUTIONAL SELL":
             sl = swing_high_15m
             risk = round(sl - entry, 4)
@@ -186,7 +183,6 @@ def evaluate_high_probability_setup(asset_info, state):
             tp2 = round(entry + (risk * 4), 4)
 
         check_list_str = "\n".join([f"✓ {c}" for c in checks])
-
         msg = (
             f"🎯 *HIGH-PROBABILITY SMC OTE ALERT* 🎯\n\n"
             f"*Asset:* {symbol}\n"
@@ -195,10 +191,9 @@ def evaluate_high_probability_setup(asset_info, state):
             f"{check_list_str}\n\n"
             f"📍 *Entry Level:* `{entry}`\n"
             f"🛡️ *Tight SL:* `{sl}` (Risk: `{risk}`)\n"
-            f"🎯 *TP1 (1:2 RR - Move SL to BE):* `{tp1}`\n"
-            f"🎯 *TP2 (1:4 RR - Main Target):* `{tp2}`"
+            f"🎯 *TP1 (1:2 RR):* `{tp1}`\n"
+            f"🎯 *TP2 (1:4 RR):* `{tp2}`"
         )
-
         send_telegram_msg(msg)
         
         state[symbol] = {
@@ -209,12 +204,13 @@ def evaluate_high_probability_setup(asset_info, state):
         save_state(state)
 
 def main():
+    print("🚀 Starting SMC Multi-Asset Confluence Scanner...")
     state = load_state()
     for asset in ASSETS:
         try:
             evaluate_high_probability_setup(asset, state)
         except Exception as e:
-            print(f"Error evaluating {asset['symbol']}: {e}")
+            print(f"❌ Error evaluating {asset['symbol']}: {e}")
 
 if __name__ == "__main__":
     main()
