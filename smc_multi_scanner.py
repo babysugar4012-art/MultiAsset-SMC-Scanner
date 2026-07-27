@@ -11,6 +11,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
+# All 4 monitored assets
 ASSETS = [
     {"symbol": "BTC/USD", "type": "crypto"},
     {"symbol": "EUR/USD", "type": "forex"},
@@ -47,13 +48,15 @@ def save_state(state):
     except Exception as e:
         print(f"Error saving state file: {e}")
 
-def fetch_data(symbol, interval, outputsize=100):
-    time.sleep(8.5) # Rate limit safety for TwelveData
+def fetch_data(symbol, interval, outputsize=50):
+    # Enforce 8.5s delay to stay under TwelveData's 8 credits/min limit
+    time.sleep(8.5)
+    
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = requests.get(url).json()
     except Exception as e:
-        print(f"  ❌ HTTP error fetching {symbol} ({interval}): {e}")
+        print(f"  ❌ HTTP error for {symbol} ({interval}): {e}")
         return None
 
     if not isinstance(res, dict) or "values" not in res:
@@ -70,6 +73,7 @@ def fetch_data(symbol, interval, outputsize=100):
 
 def is_kill_zone(current_time_utc):
     hour = current_time_utc.hour
+    # London: 07:00 - 10:00 UTC | New York: 12:00 - 16:00 UTC
     if (7 <= hour < 10) or (12 <= hour < 16):
         return True, 2
     return False, 0
