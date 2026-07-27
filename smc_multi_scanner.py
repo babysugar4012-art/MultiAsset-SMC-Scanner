@@ -47,42 +47,26 @@ def save_state(state):
     except Exception as e:
         print(f"Error saving state file: {e}")
 
-def fetch_batched_timeframes(symbol):
-    """
-    Fetches 4h, 1h, and 15min in 1 single HTTP request.
-    Consumes ONLY 1 credit per asset instead of 3 credits.
-    """
-    time.sleep(8.5) # Per-minute safety rate limit delay
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=15min,1h,4h&outputsize=50&apikey={TWELVE_DATA_API_KEY}"
-    
+def fetch_data(symbol, interval, outputsize=50):
+    time.sleep(8.5)  # Enforce 8.5s delay to stay under 8 requests/min rate limit
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = requests.get(url).json()
     except Exception as e:
-        print(f"  ❌ HTTP error for {symbol}: {e}")
-        return None, None, None
+        print(f"  ❌ HTTP error for {symbol} ({interval}): {e}")
+        return None
 
-    if not isinstance(res, dict):
-        print(f"  ❌ API error for {symbol}: {res}")
-        return None, None, None
+    if not isinstance(res, dict) or "values" not in res:
+        err_msg = res.get("message") if isinstance(res, dict) else str(res)
+        print(f"  ❌ API error for {symbol} ({interval}): {err_msg}")
+        return None
 
-    def parse_df(tf_data):
-        if not isinstance(tf_data, dict) or "values" not in tf_data:
-            err = tf_data.get("message") if isinstance(tf_data, dict) else str(tf_data)
-            print(f"  ❌ Timeframe parse error: {err}")
-            return None
-        df = pd.DataFrame(tf_data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        for col in ["open", "high", "low", "close"]:
-            df[col] = df[col].astype(float)
-        return df
-
-    # TwelveData returns dict keyed by interval when batched
-    df_15m = parse_df(res.get("15min"))
-    df_1h = parse_df(res.get("1h"))
-    df_4h = parse_df(res.get("4h"))
-
-    return df_4h, df_1h, df_15m
+    df = pd.DataFrame(res["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
 
 def is_kill_zone(current_time_utc):
     hour = current_time_utc.hour
@@ -94,8 +78,10 @@ def evaluate_high_probability_setup(asset_info, state):
     symbol = asset_info["symbol"]
     print(f"\n🔍 [EVALUATING]: {symbol}...")
     
-    # 1. Fetch ALL timeframes in 1 single API call
-    df_4h, df_1h, df_15m = fetch_batched_timeframes(symbol)
+    # Fetch timeframes individually to ensure API compatibility
+    df_4h = fetch_data(symbol, "4h", 50)
+    df_1h = fetch_data(symbol, "1h", 50)
+    df_15m = fetch_data(symbol, "15min", 50)
     
     if df_4h is None or df_1h is None or df_15m is None:
         print(f"  ⚠️ Skipped {symbol}: Could not retrieve complete timeframe data.")
@@ -217,7 +203,7 @@ def evaluate_high_probability_setup(asset_info, state):
         save_state(state)
 
 def main():
-    print("🚀 Starting SMC Multi-Asset Confluence Scanner (Batched)...")
+    print("🚀 Starting SMC Multi-Asset Confluence Scanner...")
     state = load_state()
     for asset in ASSETS:
         try:
