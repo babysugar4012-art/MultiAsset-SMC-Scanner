@@ -48,7 +48,7 @@ def save_state(state):
         print(f"Error saving state file: {e}")
 
 def fetch_data(symbol, interval, outputsize=50):
-    time.sleep(8.5)  # Enforce 8.5s delay to stay under 8 requests/min rate limit
+    time.sleep(8.5)  # Enforce delay to stay under 8 requests/min limit
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_API_KEY}"
     try:
         res = requests.get(url).json()
@@ -78,13 +78,12 @@ def evaluate_high_probability_setup(asset_info, state):
     symbol = asset_info["symbol"]
     print(f"\n🔍 [EVALUATING]: {symbol}...")
     
-    # Fetch timeframes individually to ensure API compatibility
     df_4h = fetch_data(symbol, "4h", 50)
     df_1h = fetch_data(symbol, "1h", 50)
     df_15m = fetch_data(symbol, "15min", 50)
     
     if df_4h is None or df_1h is None or df_15m is None:
-        print(f"  ⚠️ Skipped {symbol}: Could not retrieve complete timeframe data.")
+        print(f"  ⚠️ Skipped {symbol}: Incomplete market data retrieved.")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -103,14 +102,14 @@ def evaluate_high_probability_setup(asset_info, state):
     in_kz, kz_pts = is_kill_zone(now_utc)
     score += kz_pts
     if in_kz:
-        checks.append("Strict Session Kill Zone Active")
+        checks.append("Kill Zone Active")
 
     # Factor 2: 4H Macro Trend (+1)
     ema_20_4h = df_4h["close"].ewm(span=20).mean().iloc[-1]
     last_close_4h = df_4h["close"].iloc[-1]
     trend_4h = "BEARISH" if last_close_4h < ema_20_4h else "BULLISH"
     score += 1
-    checks.append(f"4H Trend Aligned ({trend_4h})")
+    checks.append(f"4H Trend: {trend_4h}")
 
     # Factor 3: 1H Liquidity Sweep (+3)
     recent_high_1h = df_1h["high"].iloc[-15:-1].max()
@@ -120,10 +119,10 @@ def evaluate_high_probability_setup(asset_info, state):
 
     if trend_4h == "BEARISH" and current_high_1h >= recent_high_1h:
         score += 3
-        checks.append("1H Buy-Side Liquidity Swept")
+        checks.append("1H Liquidity Swept (High)")
     elif trend_4h == "BULLISH" and current_low_1h <= recent_low_1h:
         score += 3
-        checks.append("1H Sell-Side Liquidity Swept")
+        checks.append("1H Liquidity Swept (Low)")
 
     # Factor 4: 15M Displacement (+2)
     c_open = df_15m["open"].iloc[-1]
@@ -135,7 +134,7 @@ def evaluate_high_probability_setup(asset_info, state):
 
     if total_range > 0 and (candle_body / total_range) >= 0.60:
         score += 2
-        checks.append("15M Strong Institutional Displacement")
+        checks.append("15M Displacement Candle")
 
     # Factor 5: OTE Fib + FVG (+2)
     swing_high_15m = df_15m["high"].iloc[-20:].max()
@@ -146,24 +145,24 @@ def evaluate_high_probability_setup(asset_info, state):
         ote_level = swing_low_15m + (rng * 0.705)
         if df_15m["close"].iloc[-1] >= ote_level:
             score += 2
-            checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
+            checks.append("15M OTE Hit")
     else:
         ote_level = swing_high_15m - (rng * 0.705)
         if df_15m["close"].iloc[-1] <= ote_level:
             score += 2
-            checks.append("15M OTE (0.705 Fib) + FVG Precision Zone")
+            checks.append("15M OTE Hit")
 
     direction = "INSTITUTIONAL SELL" if trend_4h == "BEARISH" else "INSTITUTIONAL BUY"
 
-    print(f"  📊 Confluence Score: {score}/10 ({len(checks)} checks passed)")
+    print(f"  📊 Current Score: {score}/{MIN_CONFLUENCE_SCORE} required | Conditions met: {', '.join(checks)}")
 
-    # Lockout check
+    # Lockout Check
     if last_alert_time_str and last_direction == direction:
         try:
             last_alert_time = datetime.fromisoformat(last_alert_time_str)
             hours_since = (now_utc - last_alert_time).total_seconds() / 3600.0
             if hours_since < LOCKOUT_HOURS:
-                print(f"  🛑 Lockout Active for {symbol} ({direction}): {LOCKOUT_HOURS - hours_since:.1f} hours remaining.")
+                print(f"  🛑 Alert Lockout active for {symbol} ({LOCKOUT_HOURS - hours_since:.1f}h remaining).")
                 return
         except Exception:
             pass
