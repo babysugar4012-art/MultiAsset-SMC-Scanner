@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import pandas as pd
 import numpy as np
@@ -13,6 +14,26 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ASSETS = ["BTC/USD", "EUR/USD", "USD/JPY", "XAU/USD"]
 MIN_CONFLUENCE_SCORE = 8  # Threshold out of 10 to trigger Telegram alert
+ALERT_CACHE_FILE = "last_alerts.json"
+
+# ==========================================
+# ALERT CACHE / DEDUPLICATION SYSTEM
+# ==========================================
+def load_alert_cache():
+    if os.path.exists(ALERT_CACHE_FILE):
+        try:
+            with open(ALERT_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_alert_cache(cache):
+    try:
+        with open(ALERT_CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        print(f"Error saving alert cache: {e}")
 
 # ==========================================
 # DATA RETRIEVAL (TWELVE DATA)
@@ -38,7 +59,7 @@ def fetch_ohlc(symbol, interval, outputsize=100):
         return None
 
 # ==========================================
-# SMC ANALYSIS & HTF FILTERS
+# SMC ANALYSIS & STRUCTURAL CALCULATIONS
 # ==========================================
 def get_4h_bias(df_4h):
     """ Determines HTF trend using 50 EMA and Market Structure """
@@ -48,7 +69,6 @@ def get_4h_bias(df_4h):
     close = df_4h['close'].iloc[-1]
     ema_50 = df_4h['close'].ewm(span=50).mean().iloc[-1]
     
-    # Check Higher Highs / Higher Lows over recent candles
     recent_highs = df_4h['high'].tail(10).values
     recent_lows = df_4h['low'].tail(10).values
     
@@ -80,7 +100,7 @@ def check_premium_discount(df_1h, current_price):
         return "PREMIUM"   # Optimal for SELL
 
 def detect_15m_setup(df_15m, htf_bias, pd_zone):
-    """ Analyzes 15m structural setups with strict confluence scoring """
+    """ Analyzes 15m setups with tight structural invalidation SL """
     if df_15m is None or len(df_15m) < 15:
         return None
 
@@ -89,7 +109,7 @@ def detect_15m_setup(df_15m, htf_bias, pd_zone):
     reasons = []
     direction = None
 
-    # Determine Direction Alignment
+    # Trend & Zone Alignment
     if "BULLISH" in htf_bias and pd_zone == "DISCOUNT":
         direction = "BUY"
         score += 3
@@ -99,10 +119,9 @@ def detect_15m_setup(df_15m, htf_bias, pd_zone):
         score += 3
         reasons.append("4H Bearish Trend + 1H Premium Zone (+3)")
     else:
-        # Strictly reject if HTF and Premium/Discount are misaligned
         return None
 
-    # Check Liquidity Sweep on 15m
+    # Liquidity Sweep
     recent_low = df_15m['low'].tail(10).min()
     recent_high = df_15m['high'].tail(10).max()
     prev_low = df_15m['low'].iloc[-15:-5].min()
@@ -115,9 +134,7 @@ def detect_15m_setup(df_15m, htf_bias, pd_zone):
         score += 2
         reasons.append("15m Liquidity Sweep Above Swing High (+2)")
 
-    # Check Fair Value Gap (FVG)
-    # FVG Buy: Candle 3 Low > Candle 1 High
-    # FVG Sell: Candle 3 High < Candle 1 Low
+    # Fair Value Gap (FVG)
     c1_high, c1_low = df_15m['high'].iloc[-3], df_15m['low'].iloc[-3]
     c3_high, c3_low = df_15m['high'].iloc[-1], df_15m['low'].iloc[-1]
 
@@ -128,7 +145,7 @@ def detect_15m_setup(df_15m, htf_bias, pd_zone):
         score += 3
         reasons.append("15m Bearish Fair Value Gap (FVG) (+3)")
 
-    # Check Order Block (OB) / Change of Character (CHoCH)
+    # Structure Confirmation
     ema_20 = df_15m['close'].ewm(span=20).mean().iloc[-1]
     if direction == "BUY" and current_price > ema_20:
         score += 2
@@ -138,18 +155,19 @@ def detect_15m_setup(df_15m, htf_bias, pd_zone):
         reasons.append("15m CHoCH Confirmation (+2)")
 
     if score >= MIN_CONFLUENCE_SCORE:
-        # Calculate Risk/Reward Levels
-        atr = (df_15m['high'] - df_15m['low']).tail(14).mean()
+        # Tight SMC Structural Stop Loss (High/Low of current 15m setup candle + buffer)
+        buffer = current_price * 0.0005  # 0.05% tight buffer for spread
+        
         if direction == "BUY":
-            sl = current_price - (atr * 1.5)
+            sl = df_15m['low'].iloc[-1] - buffer
             risk = current_price - sl
-            tp1 = current_price + (risk * 1.5)  # 1:1.5 RR (Break-Even / Partial Profit)
-            tp2 = current_price + (risk * 3.0)  # 1:3 RR (Final Target)
-        else:
-            sl = current_price + (atr * 1.5)
+            tp1 = current_price + (risk * 1.5)  # 1:1.5 RR (Break-Even)
+            tp2 = current_price + (risk * 3.0)  # 1:3 RR (Take Profit)
+        else: # SELL
+            sl = df_15m['high'].iloc[-1] + buffer
             risk = sl - current_price
-            tp1 = current_price - (risk * 1.5)
-            tp2 = current_price - (risk * 3.0)
+            tp1 = current_price - (risk * 1.5)  # 1:1.5 RR (Break-Even)
+            tp2 = current_price - (risk * 3.0)  # 1:3 RR (Take Profit)
 
         return {
             "direction": direction,
@@ -172,12 +190,12 @@ def send_telegram_alert(symbol, setup):
         f"----------------------------------------\n"
         f"🎯 **Confluence Score:** {setup['score']}/10\n"
         f"📍 **Entry Price:** {setup['price']:.5f}\n"
-        f"🛑 **Stop Loss:** {setup['sl']:.5f}\n"
-        f"⚡ **TP1 (1:1.5 RR - Lock BE):** {setup['tp1']:.5f}\n"
-        f"🚀 **TP2 (1:3 RR - Target):** {setup['tp2']:.5f}\n\n"
+        f"🛑 **Stop Loss (Structural):** {setup['sl']:.5f}\n"
+        f"⚡ **TP1 (1:1.5 RR - Move to BE):** {setup['tp1']:.5f}\n"
+        f"🚀 **TP2 (1:3 RR - Final Target):** {setup['tp2']:.5f}\n\n"
         f"📋 **Confluence Factors:**\n"
         + "\n".join([f"• {r}" for r in setup['reasons']]) + "\n\n"
-        f"📌 *Management:* Move SL to Entry (Break-Even) immediately upon hitting TP1!"
+        f"📌 *Management:* Set Stop Loss to Entry (Break-Even) immediately when TP1 is reached!"
     )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -200,13 +218,14 @@ def send_telegram_alert(symbol, setup):
 # ==========================================
 def main():
     print("Starting SMC Multi-Asset Scanner...")
+    alert_cache = load_alert_cache()
     
     for symbol in ASSETS:
         print(f"\nScanning {symbol}...")
         
         # 1. Fetch Timeframes
         df_4h = fetch_ohlc(symbol, "4h", outputsize=60)
-        time.sleep(8.5)  # Stay within Twelve Data 8 req/min rate limit
+        time.sleep(8.5)
         
         df_1h = fetch_ohlc(symbol, "1h", outputsize=60)
         time.sleep(8.5)
@@ -218,19 +237,29 @@ def main():
             print(f"Skipping {symbol} due to missing data.")
             continue
 
-        # 2. Higher Timeframe Alignment
+        # 2. Check Cache / Deduplication
+        latest_candle_time = str(df_15m['datetime'].iloc[-1])
+        if symbol in alert_cache and alert_cache[symbol] == latest_candle_time:
+            print(f"⏭️ Signal already sent for {symbol} at {latest_candle_time}. Skipping duplicate.")
+            continue
+
+        # 3. Higher Timeframe Alignment
         htf_bias = get_4h_bias(df_4h)
         current_price = df_15m['close'].iloc[-1]
         pd_zone = check_premium_discount(df_1h, current_price)
 
         print(f"[{symbol}] 4H Bias: {htf_bias} | 1H Zone: {pd_zone}")
 
-        # 3. Detect 15m Setup
+        # 4. Detect 15m Setup
         setup = detect_15m_setup(df_15m, htf_bias, pd_zone)
 
         if setup:
-            print(f"✅ Valid Setup Found for {symbol}! Sending Telegram Alert...")
+            print(f"✅ Valid NEW Setup Found for {symbol}! Sending Telegram Alert...")
             send_telegram_alert(symbol, setup)
+            
+            # Save timestamp to prevent duplicate notifications on subsequent cron runs
+            alert_cache[symbol] = latest_candle_time
+            save_alert_cache(alert_cache)
         else:
             print(f"❌ No high-confluence setup for {symbol}.")
 
