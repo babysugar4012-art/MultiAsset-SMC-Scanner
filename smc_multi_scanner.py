@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -13,7 +14,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
-SYMBOLS = ["EUR/USD", "XAU/USD", "BTC/USD", "USD/JPY"]
+# Restricted to 3 requested pairs
+SYMBOLS = ["EUR/USD", "BTC/USD", "USD/JPY"]
 COOLDOWN_HOURS = 4  # Prevent re-signaling same pair within 4 hours
 STATE_FILE = "scanner_state.json"
 
@@ -50,7 +52,7 @@ def send_telegram_message(message):
         print(f"❌ Failed to send Telegram alert: {e}")
 
 # ==========================================
-# 3. TWELVE DATA API FETCH
+# 3. TWELVE DATA API FETCH (WITH RATE LIMIT DELAY)
 # ==========================================
 def fetch_twelve_data(symbol, interval, outputsize=100):
     if not TWELVE_DATA_API_KEY:
@@ -63,6 +65,10 @@ def fetch_twelve_data(symbol, interval, outputsize=100):
         "outputsize": outputsize,
         "apikey": TWELVE_DATA_API_KEY
     }
+    
+    # Sleep for 8 seconds to adhere to Twelve Data 8 requests/min free tier limit
+    time.sleep(8)
+
     response = requests.get(url, params=params, timeout=15)
     data = response.json()
 
@@ -80,7 +86,7 @@ def fetch_twelve_data(symbol, interval, outputsize=100):
     return df
 
 # ==========================================
-# 4. SMC SCANNER CLASS WITH FIXES
+# 4. SMC SCANNER CLASS
 # ==========================================
 class SMCScanner:
     def __init__(self, symbol, state):
@@ -88,7 +94,7 @@ class SMCScanner:
         self.state = state
 
     def is_on_cooldown(self, current_time):
-        """Fix #1: Cooldown check to prevent signal spamming."""
+        """Cooldown check to prevent signal spamming."""
         if self.symbol in self.state:
             last_signal_str = self.state[self.symbol]
             last_signal_time = datetime.fromisoformat(last_signal_str)
@@ -97,7 +103,7 @@ class SMCScanner:
         return False
 
     def check_htf_structure(self, df_4h):
-        """Fix #2: Ensure price is in Discount (for Buy) or Premium (for Sell)."""
+        """Ensure price is in Discount (for Buy) or Premium (for Sell)."""
         recent_high = df_4h['high'].tail(50).max()
         recent_low = df_4h['low'].tail(50).min()
         equilibrium = (recent_high + recent_low) / 2
@@ -110,7 +116,7 @@ class SMCScanner:
         }
 
     def check_inducement_sweep(self, df_15m):
-        """Fix #3: Must sweep major 15m fractal swing high/low."""
+        """Must sweep major 15m fractal swing high/low."""
         df_15m['swing_low'] = df_15m['low'][(df_15m['low'] == df_15m['low'].rolling(11, center=True).min())]
         df_15m['swing_high'] = df_15m['high'][(df_15m['high'] == df_15m['high'].rolling(11, center=True).max())]
 
