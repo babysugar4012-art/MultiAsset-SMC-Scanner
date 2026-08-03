@@ -195,10 +195,10 @@ def main():
         sys.stdout.flush()
 
         try:
-            # Fetch data across timeframes
+            # Fetch data using valid Twelve Data intervals (4h, 15min, 5min)
             df_4h = fetch_twelve_data(symbol, interval="4h")
-            df_15m = fetch_twelve_data(symbol, interval="15m")
-            df_5m = fetch_twelve_data(symbol, interval="5m")
+            df_15m = fetch_twelve_data(symbol, interval="15min")
+            df_5m = fetch_twelve_data(symbol, interval="5min")
 
             scanner = SMCScanner(symbol, state)
             signal, triggered = scanner.analyze_setup(df_4h, df_15m, df_5m, now)
